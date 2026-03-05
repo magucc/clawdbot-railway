@@ -55,8 +55,14 @@ RUN apt-get update \
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
 # Install Claude CLI so the gateway can invoke it.
-RUN curl -fsSL https://claude.ai/install.sh | bash
-ENV PATH="/root/.claude/bin:${PATH}"
+# The official install script runs `claude install` which can fail silently in
+# non-interactive Docker builds, so we download the binary directly.
+RUN set -eux; \
+  CLAUDE_VERSION=$(curl -fsSL https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/latest); \
+  ARCH=$(uname -m | sed 's/x86_64/x64/' | sed 's/aarch64/arm64/'); \
+  curl -fsSL -o /usr/local/bin/claude \
+    "https://storage.googleapis.com/claude-code-dist-86c565f3-f756-42ad-8dfa-d59b1c096819/claude-code-releases/${CLAUDE_VERSION}/linux-${ARCH}/claude"; \
+  chmod +x /usr/local/bin/claude
 
 # Persist user-installed tools by default by targeting the Railway volume.
 # - npm global installs -> /data/npm
