@@ -43,6 +43,11 @@ const WORKSPACE_DIR =
 // Protect /setup with a user-provided password.
 const SETUP_PASSWORD = process.env.SETUP_PASSWORD?.trim();
 
+// GitHub OAuth + Webhook
+const GITHUB_CLIENT_ID = process.env.GITHUB_CLIENT_ID?.trim();
+const GITHUB_CLIENT_SECRET = process.env.GITHUB_CLIENT_SECRET?.trim();
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET?.trim();
+
 // Gateway admin token (protects OpenClaw gateway + Control UI).
 // Must be stable across restarts. If not provided via env, persist it in the state dir.
 function resolveGatewayToken() {
@@ -65,6 +70,31 @@ function resolveGatewayToken() {
     // best-effort
   }
   return generated;
+}
+
+// --- GitHub token persistence ---
+const GITHUB_TOKEN_PATH = path.join(STATE_DIR, "github.token");
+
+function readGitHubToken() {
+  try {
+    return fs.readFileSync(GITHUB_TOKEN_PATH, "utf8").trim() || null;
+  } catch { return null; }
+}
+
+function writeGitHubToken(token) {
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  fs.writeFileSync(GITHUB_TOKEN_PATH, token, { encoding: "utf8", mode: 0o600 });
+}
+
+// --- GitHub webhook HMAC verification ---
+function verifyGitHubSignature(payload, signature) {
+  if (!GITHUB_WEBHOOK_SECRET || !signature) return false;
+  const expected = "sha256=" + crypto.createHmac("sha256", GITHUB_WEBHOOK_SECRET)
+    .update(payload)
+    .digest("hex");
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+  } catch { return false; }
 }
 
 const OPENCLAW_GATEWAY_TOKEN = resolveGatewayToken();
@@ -1333,7 +1363,7 @@ proxy.on("error", (err, _req, res) => {
 // not just the /setup routes.  Healthcheck is excluded so Railway probes work.
 function requireDashboardAuth(req, res, next) {
   if (req.path === "/healthz" || req.path === "/setup/healthz") return next();
-  if (req.path.startsWith("/hooks")) return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
+  if (req.path.startsWith("/hooks") || req.path === "/webhook") return next(); // allow OpenClaw webhook endpoints to bypass dashboard auth
   if (!SETUP_PASSWORD) return next(); // no password configured → open
   const header = req.headers.authorization || "";
   const [scheme, encoded] = header.split(" ");
@@ -1363,6 +1393,70 @@ function attachGatewayAuthHeader(req) {
 
 proxy.on("proxyReqWs", (_proxyReq, req) => {
   attachGatewayAuthHeader(req);
+});
+
+// --- GitHub OAuth callback (GET /webhook) ---
+app.get("/webhook", async (req, res) => {
+  const code = req.query.code;
+  if (!code) {
+    return res.status(400).type("text/plain").send("Missing ?code parameter from GitHub OAuth redirect.");
+  }
+  if (!GITHUB_CLIENT_ID || !GITHUB_CLIENT_SECRET) {
+    return res.status(500).type("text/plain").send("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET not configured.");
+  }
+
+  try {
+    const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        client_id: GITHUB_CLIENT_ID,
+        client_secret: GITHUB_CLIENT_SECRET,
+        code,
+      }),
+    });
+    const data = await tokenRes.json();
+    if (data.error || !data.access_token) {
+      console.error("[webhook] GitHub token exchange failed:", data);
+      return res.status(502).type("text/plain").send(`GitHub token exchange failed: ${data.error_description || data.error || "unknown error"}`);
+    }
+
+    writeGitHubToken(data.access_token);
+    process.env.GITHUB_TOKEN = data.access_token;
+    console.log("[webhook] GitHub token saved");
+
+    return res.redirect("/setup");
+  } catch (err) {
+    console.error("[webhook] OAuth exchange error:", err);
+    return res.status(502).type("text/plain").send(`OAuth exchange error: ${String(err)}`);
+  }
+});
+
+// --- GitHub webhook events (POST /webhook) ---
+app.post("/webhook", express.raw({ type: "*/*" }), async (req, res) => {
+  const signature = req.headers["x-hub-signature-256"];
+  const payload = req.body;
+
+  if (!verifyGitHubSignature(payload, signature)) {
+    return res.status(401).type("text/plain").send("Invalid signature");
+  }
+
+  // Forward to the OpenClaw gateway at /hooks/github
+  try {
+    await ensureGatewayRunning();
+  } catch {
+    return res.status(503).type("text/plain").send("Gateway not ready");
+  }
+
+  // Proxy the request to the gateway
+  req.url = "/hooks/github";
+  attachGatewayAuthHeader(req);
+  return proxy.web(req, res, { target: GATEWAY_TARGET });
+});
+
+// --- GitHub status for setup UI ---
+app.get("/setup/api/github/status", requireSetupAuth, (_req, res) => {
+  res.json({ configured: !!readGitHubToken(), clientId: GITHUB_CLIENT_ID || null });
 });
 
 app.use(requireDashboardAuth, async (req, res) => {
@@ -1403,6 +1497,12 @@ const server = app.listen(PORT, "0.0.0.0", async () => {
   try {
     fs.chmodSync(STATE_DIR, 0o700);
   } catch {}
+
+  const ghToken = readGitHubToken();
+  if (ghToken) {
+    process.env.GITHUB_TOKEN = ghToken;
+    console.log("[wrapper] GitHub token: (set)");
+  }
 
   console.log(`[wrapper] gateway token: ${OPENCLAW_GATEWAY_TOKEN ? "(set)" : "(missing)"}`);
   console.log(`[wrapper] gateway target: ${GATEWAY_TARGET}`);

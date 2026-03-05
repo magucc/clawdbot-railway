@@ -54,6 +54,10 @@ RUN apt-get update \
 # `openclaw update` expects pnpm. Provide it in the runtime image.
 RUN corepack enable && corepack prepare pnpm@10.23.0 --activate
 
+# Install Claude CLI so the gateway can invoke it.
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH="/root/.claude/bin:${PATH}"
+
 # Persist user-installed tools by default by targeting the Railway volume.
 # - npm global installs -> /data/npm
 # - pnpm global installs -> /data/pnpm (binaries) + /data/pnpm-store (store)
